@@ -1,5 +1,9 @@
 'use client';
+
 import { useEffect, useState } from 'react';
+
+import AuthScreen from './AuthScreen';
+import { apiFetch } from '../lib/api';
 import { review, DEFAULT_GUIDELINES, SAMPLE } from '../lib/analyze';
 
 const TABS = ['Guidelines', 'Submit', 'Review', 'Insights'];
@@ -43,8 +47,9 @@ function Adder({ sec, onAdd, disabled }) {
 
 export default function Home() {
   const [ready, setReady] = useState(false);
+  const [user, setUser] = useState(null);
   const [tab, setTab] = useState('Submit');
-  const [role, setRole] = useState('Creator');
+  const role = user?.role || 'Creator';
   const [gl, setGl] = useState(DEFAULT_GUIDELINES);
   const [docs, setDocs] = useState([]);
   const [cur, setCur] = useState(null);
@@ -56,12 +61,51 @@ export default function Home() {
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
   const [analyticsError, setAnalyticsError] = useState('');
 
-  useEffect(() => {
-    try { const s = JSON.parse(localStorage.getItem('pixelpulse') || 'null'); if (s) { setGl(s.gl); setDocs(s.docs); setCur(s.cur); } } catch (e) {}
-    setReady(true);
-  }, []);
-  useEffect(() => { if (ready) localStorage.setItem('pixelpulse', JSON.stringify({ gl, docs, cur })); }, [gl, docs, cur, ready]);
+useEffect(() => {
+  async function restoreSession() {
+    try {
+      const token = sessionStorage.getItem('pixelpulse_token');
 
+      if (!token) {
+              setUser({ name: 'Public Demo', role: 'Creator' });
+              return;
+      }
+
+      const response = await apiFetch('/api/auth/me');
+
+      if (!response.ok) {
+        sessionStorage.removeItem('pixelpulse_token');
+        sessionStorage.removeItem('pixelpulse_user');
+        setUser({ name: 'Public Demo', role: 'Creator' });
+        return;
+      }
+
+      const currentUser = await response.json();
+      setUser(currentUser);
+    } catch (error) {
+      console.error('Session restoration failed:', error);
+    } finally {
+      setReady(true);
+    }
+  }
+
+  restoreSession();
+}, []);
+  useEffect(() => { if (ready) localStorage.setItem('pixelpulse', JSON.stringify({ gl, docs, cur })); }, [gl, docs, cur, ready]);
+const handleLogin = (loggedInUser) => {
+  setUser(loggedInUser);
+};
+
+const handleLogout = () => {
+  sessionStorage.removeItem('pixelpulse_token');
+  sessionStorage.removeItem('pixelpulse_user');
+  localStorage.removeItem('pixelpulse');
+  setUser(null);
+  setDocs([]);
+  setCur(null);
+  setGl(DEFAULT_GUIDELINES);
+  setTab('Submit');
+};
   const doc = docs.find((d) => d.id === cur);
   const loadAnalytics = async () => {
   setAnalyticsLoading(true);
@@ -69,7 +113,7 @@ export default function Home() {
 
   try {
     const api = (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '');
-    const response = await fetch(`${api}/api/analytics`);
+    const response = await apiFetch('/api/demo/analytics');
 
     if (!response.ok) {
       throw new Error('Could not load analytics');
@@ -100,9 +144,15 @@ useEffect(() => {
 
   const loadHistory = async () => {
     try {
+      const isDemo = reviewId.startsWith('demo_');
+
+      if (isDemo) {
+         return;
+      }
+
       const [commentsRes, revisionsRes] = await Promise.all([
-        fetch(`${api}/api/reviews/${reviewId}/comments`),
-        fetch(`${api}/api/reviews/${reviewId}/revisions`)
+         apiFetch(`/api/reviews/${reviewId}/comments`),
+         apiFetch(`/api/reviews/${reviewId}/revisions`)
       ]);
 
       if (!commentsRes.ok || !revisionsRes.ok) {
@@ -144,7 +194,10 @@ useEffect(() => {
     cancelled = true;
   };
 }, [cur, docs.find((d) => d.id === cur)?.backendReviewId]);
-  const isManager = role === 'Manager';
+  const isManager =
+  role === 'Manager' ||
+  role === 'Admin' ||
+  docs.find((d) => d.id === cur)?.backendReviewId?.startsWith('demo_');
   const upd = (fn) => setDocs((ds) => ds.map((d) => (d.id === cur ? fn({ ...d }) : d)));
   const log = (d, text) => { d.versions = [...d.versions, { v: d.versions.length + 1, note: `${role}: ${text}`, at: now() }]; };
 
@@ -152,13 +205,62 @@ useEffect(() => {
     review(content, gl, { hasImage, alt, contentType, title });
 
   const submit = async () => {
-    if (!draft.content.trim()) return setNote('Paste the content you want reviewed.');
-    setBusy(true); setNote('');
-    const { findings, engine, reviewId } = await runReview(draft.content, !!draft.img, draft.alt, draft.type, draft.title || 'Untitled draft');
-    const d = { id: uid(), title: draft.title || 'Untitled draft', type: draft.type, content: draft.content, alt: draft.alt, hasImage: !!draft.img,
-      status: 'Draft', engine, backendReviewId: reviewId || null, findings, comments: [], versions: [{ v: 1, note: `${role}: created draft, ${findings.length} findings`, at: now() }] };
-    setDocs([d, ...docs]); setCur(d.id); setDraft({ title: '', type: TYPES[0], content: '', alt: '', img: '' }); setBusy(false); setTab('Review');
-  };
+  if (!draft.content.trim()) {
+    return setNote('Paste the content you want reviewed.');
+  }
+
+  setBusy(true);
+  setNote('');
+
+  try {
+    const { findings, engine, reviewId } = await runReview(
+      draft.content,
+      !!draft.img,
+      draft.alt,
+      draft.type,
+      draft.title || 'Untitled draft'
+    );
+
+    const d = {
+      id: uid(),
+      title: draft.title || 'Untitled draft',
+      type: draft.type,
+      content: draft.content,
+      alt: draft.alt,
+      hasImage: !!draft.img,
+      status: 'Draft',
+      engine,
+      backendReviewId: reviewId || null,
+      findings,
+      comments: [],
+      versions: [
+        {
+          v: 1,
+          note: `${role}: created draft, ${findings.length} findings`,
+          at: now()
+        }
+      ]
+    };
+
+    setDocs((currentDocs) => [d, ...currentDocs]);
+    setCur(d.id);
+    setDraft({
+      title: '',
+      type: TYPES[0],
+      content: '',
+      alt: '',
+      img: ''
+    });
+    setTab('Review');
+
+  } catch (error) {
+    console.error('Review submission failed:', error);
+    setNote(error.message || 'Could not review your content. Please try again.');
+
+  } finally {
+    setBusy(false);
+  }
+};
 
   
 const resolve = async (f, status, text, reason) => {
@@ -168,8 +270,8 @@ const resolve = async (f, status, text, reason) => {
     const api = (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '');
 
     try {
-      const response = await fetch(
-        `${api}/api/reviews/${active.backendReviewId}/findings/${f.id}/decision`,
+      const response = await apiFetch(
+        `${active.backendReviewId.startsWith('demo_') ? '/api/demo' : '/api'}/reviews/${active.backendReviewId}/findings/${f.id}/decision`,
         {
           method: 'POST',
           headers: {
@@ -224,11 +326,37 @@ const resolve = async (f, status, text, reason) => {
 
   
   const rerun = async () => {
-    setBusy(true);
-    const { findings, engine } = await runReview(doc.content, doc.hasImage, doc.alt, doc.type, doc.title);
-    upd((d) => { d.findings = findings; d.engine = engine; d.status = 'Draft'; log(d, `re-ran review, ${findings.length} findings`); return d; });
+  if (!doc) return;
+
+  setBusy(true);
+  setNote('');
+
+  try {
+    const { findings, engine } = await runReview(
+      doc.content,
+      doc.hasImage,
+      doc.alt,
+      doc.type,
+      doc.title
+    );
+
+    upd((d) => {
+      d.findings = findings;
+      d.engine = engine;
+      d.status = 'Draft';
+      log(d, `re-ran review, ${findings.length} findings`);
+      return d;
+    });
+
+  } catch (error) {
+    console.error('Re-review failed:', error);
+    setNote(error.message || 'Could not re-run the review. Please try again.');
+    window.alert(error.message || 'Could not re-run the review.');
+
+  } finally {
     setBusy(false);
-  };
+  }
+};
   const addComment = async () => {
   const active = docs.find((d) => d.id === cur);
   const message = cmt.trim();
@@ -243,8 +371,8 @@ const resolve = async (f, status, text, reason) => {
   const api = (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '');
 
   try {
-    const response = await fetch(
-      `${api}/api/reviews/${active.backendReviewId}/comments`,
+    const response = await apiFetch(
+      `/api/reviews/${active.backendReviewId}/comments`,
       {
         method: 'POST',
         headers: {
@@ -263,8 +391,8 @@ const resolve = async (f, status, text, reason) => {
       throw new Error(result.detail || 'Could not save comment');
     }
 
-    const commentsResponse = await fetch(
-      `${api}/api/reviews/${active.backendReviewId}/comments`
+    const commentsResponse = await apiFetch(
+      `/api/reviews/${active.backendReviewId}/comments`
     );
 
     if (!commentsResponse.ok) {
@@ -272,8 +400,8 @@ const resolve = async (f, status, text, reason) => {
     }
 
     const comments = await commentsResponse.json();
-    const revisionsResponse = await fetch(
-  `${api}/api/reviews/${active.backendReviewId}/revisions`
+    const revisionsResponse = await apiFetch(
+  `/api/reviews/${active.backendReviewId}/revisions`
 );
 
 if (!revisionsResponse.ok) {
@@ -318,8 +446,7 @@ const setStatus = async (status, text) => {
     return;
   }
 
-  const api = (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '');
-
+  const isDemo = active.backendReviewId.startsWith('demo_');
   let endpoint = '';
   let body = {};
 
@@ -327,12 +454,12 @@ const setStatus = async (status, text) => {
     endpoint = 'submit';
     body = {
       submitted_by: role,
-      manager: 'Manager'
+      manager: 'Demo Manager'
     };
   } else if (status === 'Approved') {
     endpoint = 'approve';
     body = {
-      actor: role,
+      actor: 'Demo Manager',
       comment: 'Content reviewed and approved.'
     };
   } else if (status === 'Changes Requested') {
@@ -347,22 +474,23 @@ const setStatus = async (status, text) => {
 
     endpoint = 'request-changes';
     body = {
-      actor: role,
+      actor: 'Demo Manager',
       comment: comment.trim()
     };
   }
 
+  const apiPath = isDemo
+    ? `/api/demo/reviews/${active.backendReviewId}/${endpoint}`
+    : `/api/reviews/${active.backendReviewId}/${endpoint}`;
+
   try {
-    const response = await fetch(
-      `${api}/api/reviews/${active.backendReviewId}/${endpoint}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body)
-      }
-    );
+    const response = await apiFetch(apiPath, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
 
     const result = await response.json();
 
@@ -377,7 +505,6 @@ const setStatus = async (status, text) => {
     });
 
     window.alert(`Workflow updated: ${result.status}`);
-
   } catch (error) {
     window.alert(error.message);
   }
@@ -881,14 +1008,23 @@ const exportPDF = () => {
   const byStatus = count(all, (f) => f.status);
   const rejected = Object.entries(count(all.filter((f) => f.status === 'rejected'), (f) => f.source)).sort((a, b) => b[1] - a[1]);
   const max = byCat[0]?.[1] || 1;
+  if (!ready) {
+    return <div className="auth-shell">Loading PixelPulse...</div>;
+  }
 
+  if (!user) {
+    return <AuthScreen onLogin={handleLogin} />;
+  }
   return (
     <div className="shell">
       <header>
         <div className="brand"><b>PixelPulse</b><span>Check content against your brand before it goes live</span></div>
-        <label className="role">Viewing as
-          <select value={role} onChange={(e) => setRole(e.target.value)}>{ROLES.map((r) => <option key={r}>{r}</option>)}</select>
-        </label>
+        <div className="role">
+  <span>{user.name} · {user.role}</span>
+  <button className="ghost" onClick={handleLogout}>
+    Logout
+  </button>
+</div>
       </header>
       <nav role="tablist">{TABS.map((t) => <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{t}{t === 'Review' && pending.length ? ` (${pending.length})` : ''}</button>)}</nav>
 
@@ -956,7 +1092,7 @@ const exportPDF = () => {
                       <button className="primary" disabled={locked || doc.status === 'In Review' || pendingHigh > 0} onClick={() => setStatus('In Review', 'submitted for review')}>Submit for approval</button>
                       <button onClick={rerun} disabled={busy || locked}>Re-run review</button>
                     </>}
-                    {role !== 'Creator' && <>
+                    {isManager && <>
                       <button className="primary" disabled={doc.status !== 'In Review' || pending.length > 0} onClick={() => setStatus('Approved', 'approved for publishing')}>Approve</button>
                       <button disabled={doc.status !== 'In Review'} onClick={() => setStatus('Changes Requested', 'requested changes')}>Request changes</button>
                     </>}
